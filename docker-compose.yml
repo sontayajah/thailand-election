@@ -1,0 +1,396 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+#  Thailand Election System — Local Dev Stack
+#  Startup order: infra → kafka → realtime → gateway → app
+# ─────────────────────────────────────────────────────────────
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ─── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: election-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-election_db}
+      POSTGRES_USER: ${POSTGRES_USER:-election_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-election_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-election_user} -d ${POSTGRES_DB:-election_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+
+  # ─── Redis — Persistent (leaderboards, locks, OTP) ──────────
+  redis-persistent:
+    image: redis:7-alpine
+    container_name: election-redis-persistent
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory-policy noeviction
+      --requirepass ${REDIS_PERSISTENT_PASSWORD:-redis_persist_pass}
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_persistent_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PERSISTENT_PASSWORD:-redis_persist_pass}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  # ─── Redis — Cache (rate limiting, province cache) ───────────
+  redis-cache:
+    image: redis:7-alpine
+    container_name: election-redis-cache
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_CACHE_PASSWORD:-redis_cache_pass}
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_cache_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_CACHE_PASSWORD:-redis_cache_pass}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  # ─── Redis — asynq (job queues — noeviction) ─────────────────
+  redis-asynq:
+    image: redis:7-alpine
+    container_name: election-redis-asynq
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory-policy noeviction
+      --requirepass ${REDIS_ASYNQ_PASSWORD:-redis_asynq_pass}
+      --appendonly yes
+      --appendfsync everysec
+      --save 300 1
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_asynq_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_ASYNQ_PASSWORD:-redis_asynq_pass}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  # ─── Redpanda (Kafka-compatible, no Zookeeper) ───────────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: election-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1
+      - --memory 512M
+      - --mode dev-container
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    logging: *default-logging
+
+  # ─── Redpanda Console (topic viewer) ─────────────────────────
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: election-redpanda-console
+    restart: unless-stopped
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+    volumes:
+      - ./docker/redpanda/console-config.yml:/tmp/config.yml:ro
+    ports:
+      - "8085:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    logging: *default-logging
+
+  # ─── Kafka Topic Creator ──────────────────────────────────────
+  kafka-setup:
+    image: redpandadata/redpanda:latest
+    container_name: election-kafka-setup
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: >
+      bash -c "
+        echo 'Creating Kafka topics...' &&
+        rpk topic create votes.constituency --partitions 77 --brokers redpanda:9092 &&
+        rpk topic create votes.party_list   --partitions 10 --brokers redpanda:9092 &&
+        rpk topic create votes.referendum   --partitions 10 --brokers redpanda:9092 &&
+        rpk topic create votes.online       --partitions 20 --brokers redpanda:9092 &&
+        echo 'Topics created successfully'
+      "
+    restart: "no"
+
+  # ─── Centrifugo (WebSocket real-time server) ──────────────────
+  centrifugo:
+    image: centrifugo/centrifugo:latest
+    container_name: election-centrifugo
+    restart: unless-stopped
+    command: centrifugo -c /centrifugo/config.json
+    environment:
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:-centrifugo_secret_dev}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:-centrifugo_api_key_dev}
+      CENTRIFUGO_ADMIN_ENABLED: "true"
+      CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin_dev}
+      CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-admin_secret_dev}
+    volumes:
+      - ./docker/centrifugo/config.json:/centrifugo/config.json:ro
+    ports:
+      - "8001:8000"
+      - "8002:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    logging: *default-logging
+
+  # ─── Kong API Gateway (DB-less / declarative) ────────────────
+  # No Postgres dependency — config loaded from kong.yml at startup.
+  kong:
+    image: kong:3.9-ubuntu
+    container_name: election-kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/declarative/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8444"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_PLUGINS: bundled
+    volumes:
+      - ./docker/kong/kong.yml:/usr/local/kong/declarative/kong.yml:ro
+    ports:
+      - "8000:8000"
+      - "8444:8444"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    logging: *default-logging
+
+  # ─── nginx (reverse proxy — starts immediately, resolves upstreams per-request)
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: election-nginx
+    restart: unless-stopped
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    logging: *default-logging
+
+  # ─── DOPA Mock (Thai National ID verification stub) ───────────
+  dopa-mock:
+    build:
+      context: ./docker/dopa-mock
+      dockerfile: Dockerfile
+    container_name: election-dopa-mock
+    restart: unless-stopped
+    environment:
+      PORT: "9090"
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  # ─── Go API ───────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: election-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-election_user}:${POSTGRES_PASSWORD:-election_pass}@postgres:5432/${POSTGRES_DB:-election_db}?sslmode=disable
+      REDIS_PERSISTENT_URL: redis://:${REDIS_PERSISTENT_PASSWORD:-redis_persist_pass}@redis-persistent:6379/0
+      REDIS_CACHE_URL: redis://:${REDIS_CACHE_PASSWORD:-redis_cache_pass}@redis-cache:6379/0
+      REDIS_ASYNQ_URL: redis://:${REDIS_ASYNQ_PASSWORD:-redis_asynq_pass}@redis-asynq:6379/0
+      KAFKA_BROKERS: redpanda:9092
+      CENTRIFUGO_API_ENDPOINT: http://centrifugo:8000/api
+      DOPA_API_URL: http://dopa-mock:9090
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend:/app
+      - go_cache:/root/.cache/go
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-persistent:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-asynq:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      centrifugo:
+        condition: service_healthy
+      dopa-mock:
+        condition: service_healthy
+    logging: *default-logging
+
+  # ─── Go Worker ────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: election-worker
+    restart: unless-stopped
+    command: ["go", "run", "./cmd/worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-election_user}:${POSTGRES_PASSWORD:-election_pass}@postgres:5432/${POSTGRES_DB:-election_db}?sslmode=disable
+      REDIS_PERSISTENT_URL: redis://:${REDIS_PERSISTENT_PASSWORD:-redis_persist_pass}@redis-persistent:6379/0
+      REDIS_CACHE_URL: redis://:${REDIS_CACHE_PASSWORD:-redis_cache_pass}@redis-cache:6379/0
+      REDIS_ASYNQ_URL: redis://:${REDIS_ASYNQ_PASSWORD:-redis_asynq_pass}@redis-asynq:6379/0
+      KAFKA_BROKERS: redpanda:9092
+      CENTRIFUGO_API_ENDPOINT: http://centrifugo:8000/api
+    volumes:
+      - ./backend:/app
+      - go_cache:/root/.cache/go
+    depends_on:
+      api:
+        condition: service_started
+    logging: *default-logging
+
+  # ─── Asynqmon (Job Queue UI) ──────────────────────────────────
+  asynqmon:
+    image: hibiken/asynqmon:latest
+    container_name: election-asynqmon
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis-asynq:6379
+      REDIS_PASSWORD: ${REDIS_ASYNQ_PASSWORD:-redis_asynq_pass}
+    ports:
+      - "8081:8080"
+    depends_on:
+      redis-asynq:
+        condition: service_healthy
+    logging: *default-logging
+
+  # ─── Next.js Frontend ─────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: election-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:80/api/v1
+      NEXT_PUBLIC_CENTRIFUGO_URL: ws://localhost:8001/connection/websocket
+      # Server Components bypass nginx/Kong for zero-latency SSR fetches
+      API_INTERNAL_URL: http://api:8080/api/v1
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - node_modules_cache:/app/node_modules
+    depends_on:
+      - api
+    logging: *default-logging
+
+  # ─── Prometheus ───────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: election-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    logging: *default-logging
+
+  # ─── Grafana ──────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: election-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  redis_persistent_data:
+  redis_cache_data:
+  redis_asynq_data:
+  redpanda_data:
+  grafana_data:
+  go_cache:
+  node_modules_cache:
+
+networks:
+  default:
+    name: election-network

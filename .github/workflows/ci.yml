@@ -1,0 +1,230 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Backend — Go build, vet, test, security scan
+  # ────────────────────────────────────────────────────────────
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: election_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: go fmt check
+        run: |
+          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+            echo "The following files need formatting:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Run tests with race detector
+        env:
+          DATABASE_URL: postgres://test_user:test_pass@localhost:5432/election_test?sslmode=disable
+          REDIS_PERSISTENT_URL: redis://localhost:6379/0
+          REDIS_CACHE_URL: redis://localhost:6379/1
+          REDIS_ASYNQ_URL: redis://localhost:6379/2
+          JWT_PRIVATE_KEY_PATH: ../backend/keys/jwt_private.pem
+          JWT_PUBLIC_KEY_PATH: ../backend/keys/jwt_public.pem
+          APP_ENV: test
+          NATIONAL_ID_PEPPER: test_pepper_for_ci_only
+        run: go test ./... -race -count=1 -timeout=120s -coverprofile=coverage.out
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.out
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Build API binary
+        run: go build -ldflags="-w -s" -o /dev/null ./cmd/api/...
+
+      - name: Build Worker binary
+        run: go build -ldflags="-w -s" -o /dev/null ./cmd/worker/...
+
+      - name: Build Simulator binary
+        run: go build -ldflags="-w -s" -o /dev/null ./cmd/simulator/...
+
+  # ────────────────────────────────────────────────────────────
+  # Frontend — type check, lint, build
+  # ────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:80/api/v1
+          NEXT_PUBLIC_CENTRIFUGO_URL: ws://localhost:8001/connection/websocket
+          API_INTERNAL_URL: http://localhost:8080/api/v1
+        run: npm run build
+
+  # ────────────────────────────────────────────────────────────
+  # Database — run migrations up then down on a fresh Postgres
+  # ────────────────────────────────────────────────────────────
+  database:
+    name: Database migrations
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: election_migrate_test
+          POSTGRES_USER: migrate_user
+          POSTGRES_PASSWORD: migrate_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install golang-migrate
+        run: |
+          curl -L https://github.com/golang-migrate/migrate/releases/download/v4.17.1/migrate.linux-amd64.tar.gz | tar xvz
+          sudo mv migrate /usr/local/bin/
+
+      - name: Run migrations UP
+        env:
+          DATABASE_URL: postgres://migrate_user:migrate_pass@localhost:5432/election_migrate_test?sslmode=disable
+        run: migrate -path backend/db/migrations -database "$DATABASE_URL" up
+
+      - name: Run migrations DOWN (rollback all)
+        env:
+          DATABASE_URL: postgres://migrate_user:migrate_pass@localhost:5432/election_migrate_test?sslmode=disable
+        run: |
+          COUNT=$(ls backend/db/migrations/*.up.sql | wc -l)
+          migrate -path backend/db/migrations -database "$DATABASE_URL" down $COUNT
+
+  # ────────────────────────────────────────────────────────────
+  # Docker — build images (no push on PRs)
+  # ────────────────────────────────────────────────────────────
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: backend
+          push: false
+          tags: thailand-election/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: frontend
+          push: false
+          tags: thailand-election/frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan — backend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: thailand-election/backend:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+
+      - name: Trivy scan — frontend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: thailand-election/frontend:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL

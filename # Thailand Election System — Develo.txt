@@ -1,0 +1,518 @@
+# Thailand Election System — Development Plan
+
+## Context
+Building a dual-purpose national election platform from the PRD v4.0:
+- **Election Reporting System** — real-time public results across 77 provinces
+- **Online Voting System** — authenticated digital ballot casting
+
+This is a portfolio project. The following are **mocked/simplified**:
+- DOPA API (Thai national ID verification) → local mock service
+- OTP SMS delivery (Twilio/SNS) → log-only in dev, mock endpoint
+- Distributed Ed25519 PKI for polling stations → single test key pair
+- Vault/AWS Secrets Manager → `.env` file
+
+**Full implementations kept:** JWT auth flow, PostgreSQL schema, Redis 3-instance design, Kafka workers, Centrifugo WebSocket, Circuit Breaker, asynq background jobs, Kong API Gateway.
+
+---
+
+## Phase 1 — Project Scaffold & Local Infrastructure
+
+**Goal:** `docker-compose up -d` brings up the full stack with all services healthy.
+
+### 1.1 Repository Structure
+```
+thailand-election/
+├── backend/
+│   ├── cmd/api/          # Go API entry point
+│   ├── cmd/worker/       # Go Worker entry point
+│   ├── cmd/simulator/    # CLI vote simulator
+│   ├── internal/
+│   │   ├── api/          # Gin handlers + middleware
+│   │   ├── worker/       # Kafka consumers + asynq handlers
+│   │   ├── domain/       # Business logic (pure Go, no framework)
+│   │   ├── db/           # sqlc generated code + migrations
+│   │   ├── cache/        # Redis client wrappers (3 instances)
+│   │   ├── kafka/        # Producer + consumer wrappers
+│   │   ├── realtime/     # Centrifugo gocent client
+│   │   └── config/       # Viper config loader
+│   ├── db/
+│   │   ├── migrations/   # golang-migrate SQL files
+│   │   ├── queries/      # sqlc .sql query files
+│   │   └── sqlc.yaml
+│   ├── go.mod
+│   └── Dockerfile
+├── frontend/
+│   ├── app/              # Next.js App Router
+│   ├── components/
+│   ├── lib/
+│   ├── package.json
+│   └── Dockerfile
+├── docker/
+│   ├── kong/             # kong.yml declarative config
+│   ├── nginx/            # nginx.conf
+│   └── dopa-mock/        # Simple Go/Node mock server
+├── docker-compose.yml
+├── .env.example
+└── .gitignore
+```
+
+### 1.2 Docker Compose Services (in startup order)
+```
+postgres → redis-persistent → redis-cache → redis-asynq
+→ redpanda → centrifugo → kong → nginx
+→ dopa-mock → api → worker → asynqmon → frontend
+```
+
+### 1.3 Tasks
+- [ ] Initialize `go.mod` (module: `github.com/user/thailand-election/backend`)
+- [ ] Initialize Next.js project with TypeScript, Tailwind, App Router
+- [ ] Write `docker-compose.yml` with all 13 services
+- [ ] Write `docker/kong/kong.yml` declarative config (4 routes from PRD §2.4.1)
+- [ ] Write `docker/nginx/nginx.conf` (SSL termination + static + proxy to Kong)
+- [ ] Write `docker/dopa-mock/` — simple HTTP server returning `{valid: true}` for any 13-digit ID
+- [ ] Write `.env.example` covering all secrets from PRD §9.8
+- [ ] Add `Dockerfile` for backend (multi-stage, non-root)
+- [ ] Add `Dockerfile` for frontend (multi-stage)
+
+---
+
+## Phase 2 — Database Schema & Migrations
+
+**Goal:** All tables from PRD §6.3 created via versioned migrations, sqlc generates type-safe Go.
+
+### 2.1 Migration Files (golang-migrate, in dependency order)
+```
+000001_create_enums.up.sql               — ballot_type, referendum_vote, vote_source, voter_session_status
+000002_create_parties.up.sql
+000003_create_provinces.up.sql
+000004_create_constituencies.up.sql
+000005_create_candidates.up.sql
+000006_create_province_keys.up.sql
+000007_create_vote_events.up.sql         — append-only write model
+000008_create_read_models.up.sql         — constituency_summaries, party_list_national, referendum_*
+000009_create_province_summaries.up.sql
+000010_create_voter_registry.up.sql
+000011_create_voter_sessions.up.sql
+000012_create_voter_rights_used.up.sql   — NEVER FK to vote_events (anonymization rule)
+000013_create_vote_receipts.up.sql
+000014_create_election_config.up.sql
+000015_create_admin_users.up.sql
+000016_create_audit_logs.up.sql
+000017_seed_election_config.up.sql       — dev seed: status=open, online_voting_enabled=true
+000018_seed_master_data.up.sql           — seed parties, provinces, constituencies, candidates (2026 election data)
+```
+
+### 2.2 sqlc Queries to Generate
+- `queries/votes.sql` — InsertVoteEvent, GetVoteEventsByProvince
+- `queries/summaries.sql` — UpsertConstituencySummary, UpsertPartyListNational, UpsertReferendumSummary
+- `queries/provinces.sql` — ListProvinces, GetProvinceByID
+- `queries/candidates.sql` — ListCandidatesByConstituency, ListPartiesForBallot
+- `queries/voter.sql` — GetVoterByNationalIDHash, InsertVoterSession, GetVoterSession, InsertVoterRightsUsed, GetVoterRightsUsed
+- `queries/receipts.sql` — InsertVoteReceipt, GetVoteReceiptByHash
+- `queries/admin.sql` — GetAdminByUsername, ListAuditLogs
+
+### 2.3 Tasks
+- [ ] Write all migration `.up.sql` and `.down.sql` files
+- [ ] Write seed migration for 2026 election data (parties + real results from PRD §1.3.4)
+- [ ] Configure `sqlc.yaml`
+- [ ] Write all `.sql` query files
+- [ ] Run `sqlc generate` and verify output compiles
+
+---
+
+## Phase 3 — Backend Core: Election Reporting API
+
+**Goal:** Public read-only endpoints (B-02 through B-10) return data from PostgreSQL/Redis. No auth required.
+
+### 3.1 Go Packages to Build
+- `internal/config/` — Viper loader for all ENV vars (DB, Redis ×3, Kafka, Centrifugo, JWT)
+- `internal/db/` — pgx connection pool + sqlc querier interface
+- `internal/cache/redis.go` — 3 separate `go-redis` clients (persistent, cache, asynq)
+- `internal/api/server.go` — Gin engine setup with middleware stack
+- `internal/api/middleware/` — zerolog request logger, Prometheus metrics, Recovery, CORS, TraceID injector
+- `internal/api/handlers/reporting.go` — handlers for B-02 through B-09
+- `internal/api/handlers/health.go` — B-09: health check (DB + all Redis + Kafka + Centrifugo)
+- `internal/api/handlers/realtime.go` — B-10: Centrifugo JWT token issuer
+- `internal/domain/reporting/` — business logic: national summary, province summary, seat calculation
+
+### 3.2 Endpoints in This Phase
+```
+GET  /api/v1/health
+GET  /api/v1/provinces
+GET  /api/v1/candidates
+GET  /api/v1/parties
+GET  /api/v1/election/national/summary
+GET  /api/v1/election/provinces/:id/summary
+GET  /api/v1/election/provinces/:id/constituencies
+GET  /api/v1/election/party-list/calculate
+GET  /api/v1/election/referendum/summary
+POST /api/v1/realtime/token
+```
+
+### 3.3 Redis Integration (Circuit Breaker Pattern)
+- `internal/cache/circuit_breaker.go` — `sony/gobreaker` wrapping redis-persistent reads
+- Fallback: if CB open → read directly from PostgreSQL
+- Metric: `redis_circuit_breaker_state{instance}` gauge
+
+### 3.4 Prometheus Metrics Setup
+- `/metrics` endpoint exposed (not behind Kong, internal only)
+- RED metrics middleware on all routes
+- Key counters: `vote_ingestion_total`, `online_vote_cast_total`
+
+### 3.5 Tasks
+- [ ] `internal/config/` with all env vars
+- [ ] pgx pool + sqlc integration
+- [ ] 3 Redis client wrappers
+- [ ] Gin server + middleware (logger, metrics, CORS, traceID)
+- [ ] All reporting handlers (read from Redis → CB fallback to PG)
+- [ ] `GET /api/v1/health` — checks all dependencies
+- [ ] Centrifugo JWT token endpoint
+- [ ] Circuit breaker wrapper for redis-persistent
+- [ ] `cmd/api/main.go` — wires everything, starts server on :8080
+- [ ] Unit tests for domain/reporting (seat calculation logic — PRD §1.3.3)
+
+---
+
+## Phase 4 — Kafka Workers & Vote Ingestion
+
+**Goal:** Physical votes POST → Kafka → Worker → DB + Redis + Centrifugo broadcast.
+
+### 4.1 Physical Vote Ingestion (B-01)
+- `internal/api/handlers/ingestion.go` — `POST /api/v1/votes`
+  - Validate API Key (from Kong, but also app-level check)
+  - Verify Ed25519 payload signature against `province_keys` table
+  - Idempotency check: `SET idempotency:<key> NX EX 86400` on redis-persistent
+  - Publish to Kafka topic by ballot_type
+  - Return 202 in < 10ms
+
+### 4.2 Kafka Setup
+- `internal/kafka/producer.go` — `confluent-kafka-go` or `segmentio/kafka-go` producer
+- Redpanda in Docker Compose (Kafka-compatible, no Zookeeper)
+- 4 topics: `votes.constituency`, `votes.party_list`, `votes.referendum`, `votes.online`
+
+### 4.3 Worker (W-01 through W-07)
+- `cmd/worker/main.go` — starts 4 Kafka consumers + asynq server
+- `internal/worker/constituency_consumer.go` — consumes `votes.constituency`
+- `internal/worker/party_list_consumer.go`
+- `internal/worker/referendum_consumer.go`
+- `internal/worker/online_consumer.go`
+- Each consumer: `BEGIN TX → INSERT vote_events → UPSERT summary → COMMIT → update Redis ZSETs → Centrifugo publish`
+- `internal/realtime/centrifugo.go` — `gocent` client wrapper for broadcasting
+
+### 4.4 asynq Scheduled Jobs (W-08 through W-13)
+- `internal/worker/scheduler.go` — register all 4 scheduled tasks
+- `reconciliation_handler.go` — compare Redis ZSETs vs PostgreSQL SUM, alert on drift > 0.01%
+- `party_list_calculator.go` — recalculate 100-seat proportional allocation (PRD §1.3.3)
+- `session_cleanup_handler.go` — expire stale voter_sessions
+- `audit_export_handler.go` — daily export stub (logs to stdout for portfolio)
+
+### 4.5 Tasks
+- [ ] Kafka producer (publish by ballot_type to correct topic)
+- [ ] `POST /api/v1/votes` handler with Ed25519 sig verification + idempotency
+- [ ] 4 Kafka consumer workers (goroutines with consumer group)
+- [ ] Atomic DB updater (vote_events INSERT + summary UPSERT in 1 TX)
+- [ ] Redis ZSET updater (leaderboard ZSETs on redis-persistent)
+- [ ] Centrifugo broadcast after each batch
+- [ ] asynq scheduler + 4 scheduled job handlers
+- [ ] `cmd/worker/main.go` wiring
+- [ ] Integration test: POST vote → verify DB + Redis updated
+
+---
+
+## Phase 5 — Online Voting Backend
+
+**Goal:** Complete voter auth flow (mocked DOPA + mock SMS) + atomic vote casting.
+
+### 5.1 Auth Flow Handlers (B-12 through B-14)
+`internal/api/handlers/online_voting.go`:
+- `POST /online-voting/auth/verify-id`
+  - Hash national_id with SHA-256 + pepper → look up `voter_registry`
+  - Call DOPA mock (HTTP to `dopa-mock` service)
+  - Check all ballots already cast → return status
+- `POST /online-voting/auth/request-otp`
+  - Generate 6-digit OTP → store hash in redis-persistent (TTL 5 min)
+  - Enqueue `voter:otp:send` asynq task (mock: just log OTP to console in dev)
+  - Return 202 with expires_in_seconds
+- `POST /online-voting/auth/verify-otp`
+  - Constant-time compare hashed OTP
+  - Delete OTP from Redis (one-time use)
+  - Create `voter_sessions` record
+  - Issue anonymous JWT RS256 (contains ONLY: anonymous_vote_token, expiry, eligible_ballots — NO national_id)
+
+### 5.2 Voting Handlers (B-15 through B-18)
+- `GET /online-voting/eligibility` — which ballots remain for this session
+- `GET /online-voting/ballot/:ballot_type` — return candidates/parties for voter's constituency
+- `POST /online-voting/cast` — the critical atomic operation:
+  1. Acquire distributed lock: `SET vote_lock:{voter_session_id} NX EX 10`
+  2. `SELECT FOR UPDATE` on voter_rights_used
+  3. INSERT vote_events (anonymous_token, NO national_id)
+  4. INSERT voter_rights_used (session_id, ballot_type — NO vote choice)
+  5. COMMIT → release lock
+  6. Enqueue to `votes.online` Kafka topic
+  7. Enqueue `voter:receipt:issue` asynq task
+  8. Return 202 + receipt_id
+- `GET /online-voting/receipt/:receipt_id` — public receipt verification (no auth)
+
+### 5.3 JWT Middleware
+- `internal/api/middleware/jwt.go` — RS256 JWT validation for voter + admin routes
+- Private key: generated once, stored in `.env` (portfolio simplification)
+- Anonymous JWT payload: `{ "avt": "<uuid>", "exp": ..., "ballots": [...] }`
+
+### 5.4 asynq Task Handlers (Online Voting)
+- `voter:otp:send` → in dev: log "OTP for session X: 123456" to stdout
+- `voter:receipt:issue` → SHA-256(anonymous_token + choice_id + timestamp) → INSERT vote_receipts
+
+### 5.5 Tasks
+- [ ] RSA-4096 key pair generation script (dev only)
+- [ ] JWT middleware (RS256 validation)
+- [ ] verify-id handler (DOPA mock call + voter_registry lookup)
+- [ ] request-otp handler (Redis OTP store + asynq enqueue)
+- [ ] verify-otp handler (constant-time compare + session create + JWT issue)
+- [ ] eligibility handler
+- [ ] ballot handler (returns correct candidates for voter's constituency)
+- [ ] cast-vote handler (full atomic operation with distributed lock)
+- [ ] receipt-verify handler (public)
+- [ ] OTP send asynq handler (mock: stdout log)
+- [ ] Receipt issuer asynq handler
+- [ ] Unit tests: atomic vote cast (test TOCTOU prevention)
+- [ ] Unit tests: JWT contains no PII
+
+---
+
+## Phase 6 — Admin API
+
+**Goal:** Admin batch entry + audit log for portfolio completeness.
+
+### 6.1 Endpoints
+- `POST /api/v1/admin/votes/batch` (B-11) — bulk vote insertion for demo/testing
+- `GET /api/v1/admin/audit-logs` — read audit_logs table
+- Admin JWT middleware — same RS256 but checks `role: admin` claim + IP whitelist
+
+### 6.2 Tasks
+- [ ] Admin JWT middleware (role check)
+- [ ] Batch vote handler → loop → Kafka publish
+- [ ] Audit log handler
+- [ ] Admin user seed (username: admin, argon2id password hash)
+
+---
+
+## Phase 7 — Frontend: Election Reporting UI
+
+**Goal:** Public dashboard — interactive Thailand map, leaderboard, referendum panel, real-time WebSocket.
+
+### 7.1 Next.js App Structure
+```
+app/
+  layout.tsx                    — Root layout (ThemeProvider, QueryClient)
+  page.tsx                      — Dashboard (SSR initial data fetch)
+  province/[id]/page.tsx        — Province detail
+  referendum/page.tsx           — Referendum dashboard
+components/
+  map/ThailandMap.tsx           — SVG map, 77 provinces, color fill by party
+  map/ProvinceTooltip.tsx
+  leaderboard/NationalLeaderboard.tsx
+  leaderboard/PartySeats.tsx
+  referendum/ReferendumPanel.tsx
+  referendum/ReferendumChart.tsx
+  shared/SkeletonCard.tsx
+  shared/ConnectionStatus.tsx   — Online/Reconnecting/Offline banner
+  shared/ErrorBoundary.tsx
+lib/
+  api/client.ts                 — TanStack Query API functions
+  ws/centrifuge.ts              — centrifuge-js setup + channel subscriptions
+  store/ui.ts                   — Zustand: dark mode, map ballot toggle
+  types/election.ts             — TypeScript types matching backend schemas
+```
+
+### 7.2 Key Implementation Notes
+- **SSR initial load**: `page.tsx` fetches national summary server-side (avoids flash)
+- **TanStack Query**: client-side cache, auto-refetch every 10s (Centrifugo fallback per F-09)
+- **Centrifugo channels**: subscribe to `election:thailand`, `election:province:<id>`, `election:referendum`
+- **SVG Map**: Custom Thailand SVG with province path IDs matching `provinces.svg_path_id` column
+- **Party List Seat Calculator**: real-time display of PRD §1.3.3 proportional formula
+- **Dark mode**: `prefers-color-scheme` CSS + manual toggle via Zustand
+
+### 7.3 Tasks
+- [ ] Next.js project setup (App Router, Tailwind, shadcn/ui init)
+- [ ] TypeScript types matching all backend response schemas
+- [ ] TanStack Query setup + API client functions
+- [ ] Zustand store (dark mode, ballot type toggle, selected province)
+- [ ] Thailand SVG map component (color provinces by leading party)
+- [ ] Province click → fetch province detail panel
+- [ ] National leaderboard table (real-time updates)
+- [ ] Party seat summary (Constituency + Party List combined)
+- [ ] Referendum dashboard (bar chart — Approve / Disagree / Abstain)
+- [ ] centrifuge-js WebSocket integration
+- [ ] Connection status banner (F-09: Online/Reconnecting/Offline)
+- [ ] Skeleton screens for all data-loading states (F-10)
+- [ ] Dark mode toggle
+- [ ] Responsive layout (mobile-first)
+
+---
+
+## Phase 8 — Frontend: Online Voting Portal
+
+**Goal:** Authenticated voter flow — identity verification → OTP → ballot → cast → receipt.
+
+### 8.1 App Structure
+```
+app/vote/
+  page.tsx                      — Entry: National ID input
+  otp/page.tsx                  — OTP verification
+  ballot/page.tsx               — Ballot selection dashboard
+  ballot/[type]/page.tsx        — Individual ballot (candidates / parties / referendum)
+  confirm/page.tsx              — Confirmation step
+  receipt/page.tsx              — Post-vote receipt display
+  receipt/[hash]/page.tsx       — Public receipt verification
+components/voting/
+  NationalIdForm.tsx            — 13-digit input + Luhn validation
+  OtpInput.tsx                  — react-otp-input (6 digits)
+  BallotCard.tsx                — Candidate or party selection card
+  ConfirmDialog.tsx             — Final confirm (shadcn AlertDialog)
+  VotingProgress.tsx            — Which ballots cast / remaining
+  ReceiptCard.tsx               — Receipt hash display + copy button
+lib/
+  voting/session.ts             — JWT storage (sessionStorage, never localStorage)
+  voting/api.ts                 — TanStack Query mutations for voting endpoints
+```
+
+### 8.2 Key Implementation Notes
+- JWT stored in `sessionStorage` only (cleared on tab close)
+- Each ballot type is a separate step (3 separate POST /cast calls)
+- `confirm: true` required in cast request body
+- Show remaining ballots after each cast
+- OTP timeout countdown displayed (5-min expiry)
+
+### 8.3 Tasks
+- [ ] National ID input form (13-digit validation, Luhn check)
+- [ ] OTP input page with countdown timer
+- [ ] Ballot selection dashboard (shows eligible/cast status per ballot)
+- [ ] Constituency ballot page (candidate cards with candidate number)
+- [ ] Party list ballot page (party cards)
+- [ ] Referendum ballot page (Approve / Disagree / Abstain)
+- [ ] Confirmation dialog before final cast
+- [ ] Post-cast receipt display
+- [ ] Public receipt verification page
+- [ ] JWT session management (sessionStorage)
+- [ ] Voting session timeout (30-min countdown, redirect on expiry)
+- [ ] Error states (already voted, window closed, DOPA failure)
+
+---
+
+## Phase 9 — Vote Simulator (Portfolio Demo Tool)
+
+**Goal:** CLI tool to generate realistic vote data for live demo.
+
+### 9.1 Simulator Features
+```
+cmd/simulator/main.go
+  --mode=physical        # POST /api/v1/votes concurrently from 77 provinces
+  --mode=online          # Simulates voter auth → OTP → cast via API
+  --rps=100              # Requests per second
+  --duration=60s         # How long to run
+  --ballot=all           # Which ballot types to simulate
+  --verify               # After run: compare DB totals vs Redis ZSETs
+```
+
+### 9.2 Tasks
+- [ ] Physical vote generator (concurrent goroutines, 1 per province)
+- [ ] Online vote simulator (auth flow → cast, using pre-seeded test voter registry)
+- [ ] Load profile config flags
+- [ ] Result verifier (DB ↔ Redis comparison)
+- [ ] Seed script: insert test voters into voter_registry for simulator use
+
+---
+
+## Phase 10 — CI/CD, Hardening & Portfolio Polish
+
+**Goal:** Production-ready pipeline, security checks, documentation.
+
+### 10.1 GitHub Actions Pipeline
+```yaml
+on: [push, pull_request]
+jobs:
+  backend:
+    - go fmt / go vet
+    - go test ./... -race -count=1
+    - govulncheck ./...
+    - Docker build (multi-stage)
+  frontend:
+    - npm ci
+    - npm run typecheck
+    - npm audit
+    - npm run lint
+    - Trivy image scan
+  database:
+    - Run migrations on test DB
+    - Run migrate down + up (rollback test)
+```
+
+### 10.2 Security Hardening
+- [ ] Verify `vote_events` has no direct PII (unit test asserts no national_id column populated)
+- [ ] Verify `voter_rights_used` and `vote_events` have no shared FK (schema test)
+- [ ] Constant-time OTP compare (use `crypto/subtle.ConstantTimeCompare`)
+- [ ] `httponly` flag on any cookies, `SameSite=Strict`
+- [ ] All Gin handlers validated with `go-playground/validator` struct tags
+- [ ] Request size limit on vote ingestion endpoint
+
+### 10.3 Observability
+- [ ] Prometheus scrape config in docker-compose
+- [ ] Grafana dashboard JSON (RED metrics + asynq queue sizes)
+- [ ] zerolog structured logging — verify no PII in log output
+- [ ] asynqmon accessible at `localhost:8081`
+
+### 10.4 Portfolio README
+- [ ] Architecture diagram (text-based, from PRD §2.4.1)
+- [ ] Quick start: `docker-compose up -d && make seed && make simulate`
+- [ ] Feature list with PRD feature IDs
+- [ ] Security architecture callout (vote anonymization diagram from PRD §9.2)
+
+---
+
+## Build Order Summary
+
+| Phase | What You Get | Est. Complexity |
+|---|---|---|
+| 1 | Running `docker-compose up` with all services | Medium |
+| 2 | Full DB schema + sqlc type-safe Go | Medium |
+| 3 | Reporting API serving real data | Medium |
+| 4 | Kafka pipeline — votes flow end-to-end | High |
+| 5 | Online voting with atomic cast + anonymization | High |
+| 6 | Admin API (batch + audit) | Low |
+| 7 | Public dashboard with real-time WebSocket map | High |
+| 8 | Voter portal — full auth + ballot UI | High |
+| 9 | Simulator for live demo | Medium |
+| 10 | CI/CD + hardening + polish | Medium |
+
+## Critical Files
+- `backend/db/migrations/` — all schema definitions
+- `backend/internal/api/handlers/online_voting.go` — core security path
+- `backend/internal/domain/reporting/seat_calculator.go` — party list formula (PRD §1.3.3)
+- `backend/internal/worker/atomic_updater.go` — the TX that must never partially commit
+- `frontend/app/vote/` — entire voter-facing flow
+- `frontend/components/map/ThailandMap.tsx` — SVG map (portfolio centerpiece)
+- `docker/kong/kong.yml` — all rate limits and auth plugins
+- `docker-compose.yml` — orchestrates 13 services
+
+## Mocked / Simplified for Portfolio
+| Real System | Portfolio Simplification |
+|---|---|
+| DOPA API (govt) | `docker/dopa-mock/` returns `{valid:true}` for any 13-digit ID |
+| Twilio/SNS SMS | asynq OTP handler returns OTP in `POST /request-otp` response (dev mode only); **UI displays it on screen** |
+| Vault / HSM | RSA-4096 key pair in `.env` (generated locally, never committed) |
+| Ed25519 PKI (77 stations) | Single test key pair; simulator signs with it |
+| argon2id admin passwords | Same argon2id lib, simpler key derivation params in dev |
+
+## User Decisions
+- **Scope:** Full system — all 10 phases
+- **SVG Map:** Source a publicly available Thailand province SVG (D3-compatible TopoJSON from naturalearthdata or GADM); adapt path IDs to match `provinces.svg_path_id` column
+- **Mock OTP:** Dev mode — `POST /request-otp` response body includes `"dev_otp": "123456"`; frontend displays it in a yellow dev banner below the OTP input
+
+## Verification Plan
+1. `docker-compose up -d` → all services healthy
+2. Run `make seed` → DB seeded with 2026 election data
+3. Run `make simulate --mode=physical --rps=50 --duration=30s` → watch Grafana
+4. Open `localhost:3000` → see map update in real-time via WebSocket
+5. Go to `localhost:3000/vote` → enter any 13-digit ID → OTP shown in terminal → cast all 3 ballots → get receipt
+6. Check `localhost:8081` (asynqmon) → see completed jobs
+7. `make simulate --verify` → DB totals match Redis ZSETs

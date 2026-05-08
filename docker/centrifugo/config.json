@@ -1,0 +1,44 @@
+{
+  "client": {
+    "token": {
+      "hmac_secret_key": "8131a75a-c790-42d5-8c9a-b4cc248b4377"
+    },
+    "allowed_origins": ["http://localhost:3000", "http://localhost:80"]
+  },
+  "http_api": {
+    "key": "5a99e2d8-0c92-4164-904d-d826c8e8d81c"
+  },
+  "admin": {
+    "enabled": true,
+    "password": "admin_password",
+    "secret": "admin_secret"
+  },
+  "debug": {
+    "enabled": true
+  },
+  "health": {
+    "enabled": true
+  },
+  "log": {
+    "level": "info"
+  },
+  "channel": {
+    "namespaces": [
+      {
+        "name": "election",
+        "allow_publish_for_subscriber": false,
+        "allow_subscribe_for_anonymous": true,
+        "history_size": 10,
+        "history_ttl": "60s",
+        "presence": false,
+        "join_leave": false
+      }
+    ]
+  },
+  "uni_http_stream": {
+    "enabled": true
+  },
+  "uni_sse": {
+    "enabled": true
+  }
+}
